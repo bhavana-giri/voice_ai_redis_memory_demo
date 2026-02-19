@@ -1,5 +1,6 @@
 """Memory client wrapper for Redis Agent Memory Server."""
 import os
+import logging
 import asyncio
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Tuple
@@ -10,6 +11,8 @@ from agent_memory_client import create_memory_client
 from agent_memory_client.models import MemoryMessage, ClientMemoryRecord, MemoryTypeEnum
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryClient:
@@ -158,7 +161,7 @@ class MemoryClient:
                 "stored": True
             }
         except Exception as e:
-            print(f"Error saving mood: {e}")
+            logger.error(f"Error saving mood: {e}")
             return {
                 "status": "error",
                 "error": str(e),
@@ -221,7 +224,7 @@ class MemoryClient:
                 "stored_in_long_term": True
             }
         except Exception as e:
-            print(f"Error creating long-term memory: {e}")
+            logger.error(f"Error creating long-term memory: {e}")
             return {
                 "status": "error",
                 "error": str(e),
@@ -301,7 +304,7 @@ class MemoryClient:
         import time
         t0 = time.time()
         client = await self._get_client()
-        print(f"[TIMING] Memory client get: {time.time() - t0:.2f}s")
+        logger.debug(f"Memory client get: {time.time() - t0:.2f}s")
 
         try:
             # Import filter classes
@@ -317,7 +320,7 @@ class MemoryClient:
                 limit=limit,
                 distance_threshold=distance_threshold
             )
-            print(f"[TIMING] Memory search API call: {time.time() - t1:.2f}s")
+            logger.debug(f"Memory search API call: {time.time() - t1:.2f}s")
 
             # Convert to list of dicts
             memories = []
@@ -337,7 +340,7 @@ class MemoryClient:
             return memories
 
         except Exception as e:
-            print(f"Error searching long-term memory: {e}")
+            logger.error(f"Error searching long-term memory: {e}")
             return []
 
     async def search_memory_tool(
@@ -373,7 +376,7 @@ class MemoryClient:
             )
             return result
         except Exception as e:
-            print(f"Error in search_memory_tool: {e}")
+            logger.error(f"Error in search_memory_tool: {e}")
             return {
                 "summary": f"Search failed: {e}",
                 "memories": [],
@@ -425,11 +428,11 @@ class MemoryClient:
                 user_id=user_id
             )
 
-            print(f"[Working Memory] Saved conversation turn - Session: {session_id}")
+            logger.debug(f"Working memory saved conversation turn - Session: {session_id}")
             return True
 
         except Exception as e:
-            print(f"[Working Memory] Error saving turn: {e}")
+            logger.warning(f"Working memory error saving turn: {e}")
             return False
 
     async def get_conversation_context(
@@ -455,7 +458,7 @@ class MemoryClient:
         import time
         t0 = time.time()
         client = await self._get_client()
-        print(f"[TIMING] Working memory client get: {time.time() - t0:.2f}s")
+        logger.debug(f"Working memory client get: {time.time() - t0:.2f}s")
 
         try:
             t1 = time.time()
@@ -463,7 +466,7 @@ class MemoryClient:
                 session_id=session_id,
                 user_id=user_id
             )
-            print(f"[TIMING] Working memory API call: {time.time() - t1:.2f}s")
+            logger.debug(f"Working memory API call: {time.time() - t1:.2f}s")
 
             if not working_memory.messages:
                 return ""
@@ -480,7 +483,7 @@ class MemoryClient:
             return "\n".join(lines)
 
         except Exception as e:
-            print(f"[Working Memory] Error getting context: {e}")
+            logger.warning(f"Working memory error getting context: {e}")
             return ""
 
     async def get_combined_context(

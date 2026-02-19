@@ -4,12 +4,15 @@ Uses embeddings to match user queries to intents - faster than LLM, more accurat
 """
 
 import os
+import logging
 from typing import Optional, Tuple
 from dotenv import load_dotenv
 from redisvl.extensions.router import SemanticRouter, Route
 from redisvl.utils.vectorize import OpenAITextVectorizer
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # Define routes with example utterances
 LOG_ROUTE = Route(
@@ -104,7 +107,7 @@ class IntentRouter:
             overwrite=True,  # Rebuild on startup for fresh embeddings
         )
         self._initialized = True
-        print("[IntentRouter] Initialized with semantic routes")
+        logger.info("IntentRouter initialized with semantic routes")
 
     def detect(self, text: str, distance_threshold: float = 0.5) -> Tuple[str, float]:
         """

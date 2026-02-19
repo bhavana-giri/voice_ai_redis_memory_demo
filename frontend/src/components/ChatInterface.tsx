@@ -15,7 +15,7 @@ interface ChatInterfaceProps {
   onClose: () => void;
 }
 
-const API_BASE_URL = 'http://localhost:8080';
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
 // Generate a unique session ID
 function generateSessionId(): string {
@@ -149,14 +149,14 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
             sourceBuffer.addEventListener('updateend', () => {
               if (audioQueue.length > 0 && sourceBuffer && !sourceBuffer.updating) {
                 const chunk = audioQueue.shift()!;
-                sourceBuffer.appendBuffer(chunk);
+                sourceBuffer.appendBuffer(new Uint8Array(chunk).buffer as ArrayBuffer);
               }
             });
 
             // Append any chunks that arrived before sourceopen
             if (audioQueue.length > 0 && !sourceBuffer.updating) {
               const chunk = audioQueue.shift()!;
-              sourceBuffer.appendBuffer(chunk);
+              sourceBuffer.appendBuffer(new Uint8Array(chunk).buffer as ArrayBuffer);
             }
           } catch (e) {
             console.error('Failed to create source buffer:', e);
@@ -171,7 +171,7 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
 
         if (isSourceOpen && sourceBuffer && !sourceBuffer.updating) {
           try {
-            sourceBuffer.appendBuffer(chunk);
+            sourceBuffer.appendBuffer(new Uint8Array(chunk).buffer as ArrayBuffer);
             // Start playback after first chunk
             if (audio && audio.paused) {
               audio.play().catch(console.error);
@@ -226,13 +226,15 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
                 setEntryCount(msg.entry_count);
               } else if (msg.type === 'done') {
                 // Signal end of stream to MediaSource
-                if (mediaSource && mediaSource.readyState === 'open') {
+                const ms = mediaSource as MediaSource | null;
+                if (ms && ms.readyState === 'open') {
                   // Wait for all buffers to be appended before ending
+                  const sb = sourceBuffer as SourceBuffer | null;
                   const endStream = () => {
-                    if (sourceBuffer && !sourceBuffer.updating && audioQueue.length === 0) {
+                    if (sb && !sb.updating && audioQueue.length === 0) {
                       try {
-                        mediaSource!.endOfStream();
-                      } catch (e) {
+                        ms.endOfStream();
+                      } catch {
                         // Ignore if already ended
                       }
                     } else {

@@ -1,6 +1,7 @@
 """FastAPI backend for Voice Journal UI."""
 import os
 import sys
+import logging
 import base64
 import tempfile
 import uuid
@@ -18,6 +19,10 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 from src.audio_handler import AudioHandler
 from src.journal_manager import JournalManager
@@ -38,9 +43,9 @@ async def lifespan(app: FastAPI):
     # Check memory server health
     is_healthy = await memory_client.health_check()
     if is_healthy:
-        print("[OK] Connected to Redis Agent Memory Server")
+        logger.info("Connected to Redis Agent Memory Server")
     else:
-        print("[WARN] Redis Agent Memory Server not available - memory features disabled")
+        logger.warning("Redis Agent Memory Server not available - memory features disabled")
 
     yield
     # Cleanup
@@ -123,12 +128,12 @@ async def transcribe_audio(request: TranscribeRequest):
                 transcript, language_code = await audio_handler.transcribe_stream(
                     temp_path, language_code=request.language_code
                 )
-                print(f"[TIMING] STT (streaming): {time.time() - stt_start:.2f}s")
+                logger.debug(f"STT (streaming): {time.time() - stt_start:.2f}s")
             finally:
                 os.unlink(temp_path)
         else:
             # Non-WAV format (browser webm/opus): use REST API (auto-detects format)
-            print(f"[DEBUG] Non-WAV audio, first bytes: {audio_data[:12]}, using REST API")
+            logger.debug(f"Non-WAV audio, first bytes: {audio_data[:12]}, using REST API")
 
             # Determine extension from magic bytes
             if audio_data[:4] == b'\x1aE\xdf\xa3':  # webm magic bytes
@@ -149,7 +154,7 @@ async def transcribe_audio(request: TranscribeRequest):
                 transcript, language_code, _ = audio_handler.transcribe(
                     temp_path, language_code=request.language_code
                 )
-                print(f"[TIMING] STT (REST): {time.time() - stt_start:.2f}s")
+                logger.debug(f"STT (REST): {time.time() - stt_start:.2f}s")
             finally:
                 os.unlink(temp_path)
 
@@ -167,9 +172,9 @@ async def transcribe_audio(request: TranscribeRequest):
                     topics=["journal", "voice_entry"],
                     session_id=session_id
                 )
-                print(f"[OK] Stored voice entry in long-term memory: {memory_entry.get('memory_id', 'unknown')}")
+                logger.info(f"Stored voice entry in long-term memory: {memory_entry.get('memory_id', 'unknown')}")
             except Exception as mem_err:
-                print(f"[WARN] Failed to store in memory: {mem_err}")
+                logger.warning(f"Failed to store in memory: {mem_err}")
 
         return {
             "transcript": transcript,
@@ -231,9 +236,9 @@ async def create_entry(entry: EntryCreate):
                     "source": "manual_entry"
                 }
             )
-            print(f"[OK] Stored entry in memory: {session_id}")
+            logger.info(f"Stored entry in memory: {session_id}")
         except Exception as mem_err:
-            print(f"[WARN] Failed to store in memory: {mem_err}")
+            logger.warning(f"Failed to store in memory: {mem_err}")
 
     # Also store in journal manager for local persistence
     new_entry = journal_manager.create_entry(
@@ -409,12 +414,12 @@ async def agent_chat(request: AgentChatRequest):
                     text = transcript
                     transcribed_text = transcript
                     timings['stt'] = time.time() - stt_start
-                    print(f"[TIMING] STT (streaming): {timings['stt']:.2f}s - '{transcript}'")
+                    logger.debug(f"STT (streaming): {timings['stt']:.2f}s - '{transcript}'")
                 finally:
                     os.unlink(temp_path)
             else:
                 # Non-WAV format (browser webm/opus): use REST API (auto-detects format)
-                print(f"[DEBUG] Non-WAV audio, first bytes: {audio_data[:12]}, using REST API")
+                logger.debug(f"Non-WAV audio, first bytes: {audio_data[:12]}, using REST API")
 
                 # Determine extension from magic bytes
                 if audio_data[:4] == b'\x1aE\xdf\xa3':  # webm magic bytes
@@ -437,18 +442,23 @@ async def agent_chat(request: AgentChatRequest):
                     )
                     text = transcript
                     transcribed_text = transcript
+                    detected_language = lang_code  # Use detected language for TTS
                     timings['stt'] = time.time() - stt_start
-                    print(f"[TIMING] STT (REST): {timings['stt']:.2f}s - '{transcript}'")
+                    logger.debug(f"STT (REST): {timings['stt']:.2f}s - '{transcript}' [lang={lang_code}]")
                 finally:
                     os.unlink(temp_path)
 
         except Exception as e:
             import traceback
             traceback.print_exc()
+            # Check for common issues
+            error_msg = str(e).lower()
+            if "timeout" in error_msg or "no speech" in error_msg:
+                raise HTTPException(status_code=400, detail="No speech detected in audio. Please try speaking again.")
             raise HTTPException(status_code=400, detail=f"Audio transcription failed: {e}")
 
     if not text:
-        raise HTTPException(status_code=400, detail="Either text or audio_base64 is required")
+        raise HTTPException(status_code=400, detail="No speech detected. Please try speaking again.")
 
     # Generate session_id if not provided (for working memory / conversation continuity)
     session_id = request.session_id or f"session_{uuid.uuid4().hex[:12]}"
@@ -460,7 +470,7 @@ async def agent_chat(request: AgentChatRequest):
         agent_start = time.time()
         response_text, _ = await agent.process_input(text)
         timings['agent'] = time.time() - agent_start
-        print(f"[TIMING] Agent processing: {timings['agent']:.2f}s")
+        logger.debug(f"Agent processing: {timings['agent']:.2f}s")
 
         # Get TTS audio for response (using streaming for faster first-byte)
         audio_base64 = None
@@ -472,17 +482,17 @@ async def agent_chat(request: AgentChatRequest):
             )
             audio_base64 = base64.b64encode(audio_bytes).decode()
             timings['tts'] = time.time() - tts_start
-            print(f"[TIMING] TTS (streaming): {timings['tts']:.2f}s")
+            logger.debug(f"TTS (streaming): {timings['tts']:.2f}s")
         except Exception as tts_err:
-            print(f"TTS streaming failed, trying non-streaming: {tts_err}")
+            logger.warning(f"TTS streaming failed, trying non-streaming: {tts_err}")
             # Fallback to non-streaming
             try:
                 audio_bytes = audio_handler.text_to_speech(response_text, "en-IN", "shubh")
                 audio_base64 = base64.b64encode(audio_bytes).decode()
                 timings['tts'] = time.time() - tts_start
-                print(f"[TIMING] TTS (fallback): {timings['tts']:.2f}s")
+                logger.debug(f"TTS (fallback): {timings['tts']:.2f}s")
             except Exception as e2:
-                print(f"TTS fallback also failed: {e2}")
+                logger.error(f"TTS fallback also failed: {e2}")
 
         # Get current entry count
         entry_count = agent.store.get_entry_count(request.user_id)
@@ -491,7 +501,7 @@ async def agent_chat(request: AgentChatRequest):
         intent_str = agent.state.mode.value  # "log" or "chat"
 
         timings['total'] = time.time() - total_start
-        print(f"[TIMING] TOTAL: {timings['total']:.2f}s | STT: {timings.get('stt', 0):.2f}s | Agent: {timings.get('agent', 0):.2f}s | TTS: {timings.get('tts', 0):.2f}s")
+        logger.info(f"Request completed: {timings['total']:.2f}s (STT: {timings.get('stt', 0):.2f}s, Agent: {timings.get('agent', 0):.2f}s, TTS: {timings.get('tts', 0):.2f}s)")
 
         return AgentChatResponse(
             response=response_text,
@@ -579,7 +589,7 @@ async def agent_chat_stream(request: AgentChatRequest):
                 # Yield audio chunk with a simple prefix to identify it
                 yield b"AUDIO:" + base64.b64encode(chunk) + b"\n"
         except Exception as e:
-            print(f"[TTS Stream Error] {e}")
+            logger.error(f"TTS stream error: {e}")
             # Yield error message
             yield json.dumps({"type": "error", "message": str(e)}).encode() + b"\n"
 

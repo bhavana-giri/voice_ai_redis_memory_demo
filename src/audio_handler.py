@@ -265,6 +265,7 @@ class AudioHandler:
             Tuple of (transcript, language_code)
         """
         import time
+        import asyncio
         t0 = time.time()
 
         # Read and encode audio file
@@ -297,20 +298,29 @@ class AudioHandler:
 
                 print(f"[TIMING] STT audio sent: {time.time() - t0:.2f}s")
 
-                # Use async for iteration pattern (the __aiter__ method in SDK)
-                # This is the correct pattern - sends audio first, then iterates for response
-                async for message in ws:
-                    print(f"[TIMING] STT response received: {time.time() - t0:.2f}s")
+                # Use async for iteration with timeout protection
+                # This prevents hanging on empty/silent audio
+                async def receive_transcript():
+                    async for message in ws:
+                        print(f"[TIMING] STT response received: {time.time() - t0:.2f}s")
 
-                    # Extract transcript from response
-                    # Response has: type='data', data.transcript='...'
-                    if hasattr(message, 'data') and hasattr(message.data, 'transcript'):
-                        transcript = message.data.transcript
-                        detected_lang = getattr(message.data, 'language_code', None) or language_code or "en-IN"
-                        if transcript:
-                            return transcript, detected_lang
+                        # Extract transcript from response
+                        # Response has: type='data', data.transcript='...'
+                        if hasattr(message, 'data') and hasattr(message.data, 'transcript'):
+                            transcript = message.data.transcript
+                            detected_lang = getattr(message.data, 'language_code', None) or language_code or "en-IN"
+                            if transcript:
+                                return transcript, detected_lang
+                    return None, None
 
-                raise Exception("No transcript received from WebSocket")
+                try:
+                    result = await asyncio.wait_for(receive_transcript(), timeout=timeout)
+                    if result[0]:
+                        return result
+                    raise Exception("Empty transcript received")
+                except asyncio.TimeoutError:
+                    print(f"[STT Stream] Timeout after {timeout}s - no speech detected")
+                    raise Exception("STT timeout - no speech detected in audio")
 
         except Exception as e:
             print(f"[STT Stream] Error: {e}, falling back to REST API")

@@ -53,9 +53,8 @@ export default function RecordingModal({ isOpen, onClose, onSave }: RecordingMod
           setLanguageCode(data.language_code);
           setSessionId(data.session_id);
 
-          console.log('[OK] Voice stored in memory:', data.session_id);
         } catch (apiError) {
-          console.error('API error:', apiError);
+          void apiError;
           setError('Failed to transcribe. Make sure the backend server is running.');
           setTranscript('');
         } finally {
@@ -64,7 +63,7 @@ export default function RecordingModal({ isOpen, onClose, onSave }: RecordingMod
       };
       reader.readAsDataURL(blob);
     } catch (err) {
-      console.error('Error processing audio:', err);
+      void err;
       setError('Failed to process audio');
       setIsTranscribing(false);
     }

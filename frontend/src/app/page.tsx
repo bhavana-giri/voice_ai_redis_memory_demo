@@ -71,7 +71,10 @@ export default function Home() {
     setEntries((prev) => prev.filter((e) => e.id !== entryId));
   };
 
-  const handleFavorite = (entryId: string) => console.log('Favorite:', entryId);
+  const handleFavorite = (entryId: string) => {
+    // TODO: Implement favorite functionality
+    void entryId;
+  };
 
   const handleMoodSelect = async (mood: string, emoji: string) => {
     if (moodSaving) return;
@@ -80,7 +83,8 @@ export default function Home() {
     setSelectedMood(mood);
 
     try {
-      const response = await fetch('http://localhost:8080/api/mood', {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+      const response = await fetch(`${apiUrl}/api/mood`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mood, emoji, user_id: 'default_user' }),
@@ -89,10 +93,8 @@ export default function Home() {
       if (!response.ok) {
         throw new Error('Failed to save mood');
       }
-
-      console.log('Mood saved:', mood, emoji);
     } catch (error) {
-      console.error('Error saving mood:', error);
+      // Silently handle error - UI will reset selected mood
       setSelectedMood(null);
     } finally {
       setMoodSaving(false);
@@ -115,7 +117,6 @@ export default function Home() {
     };
     setEntries((prev) => [newEntry, ...prev]);
     setIsRecordingModalOpen(false);
-    console.log('[OK] Entry saved with session:', sessionId);
   };
 
   return (

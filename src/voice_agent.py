@@ -3,9 +3,10 @@
 Handles:
 - Mode switching (Log mode vs Chat mode)
 - Context assembly from retrieved entries
-- Natural voice-first response generation
+- Natural voice-first response generation (via Ollama)
 """
 import os
+import logging
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
@@ -13,13 +14,18 @@ from datetime import datetime
 import httpx
 from dotenv import load_dotenv
 
-from src.journal_store import JournalStore
-from src.intent_detector import Intent, IntentResult  # Keep Intent/IntentResult, remove IntentDetector
+from src.intent_detector import Intent, IntentResult
 from src.memory_client import MemoryClient
 from src.calendar_client import CalendarClient
 from src.intent_router import get_intent_router
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# Ollama configuration
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
 
 class AgentMode(Enum):
@@ -46,10 +52,8 @@ class VoiceJournalAgent:
     ):
         self.user_id = user_id
         self.session_id = session_id  # For working memory (conversation continuity)
-        self.store = JournalStore()
         self.memory_client = memory_client  # For searching long-term memory (memory_idx)
         self.state = AgentState()
-        self.api_key = os.getenv("OPENAI_API_KEY")
 
         # Initialize calendar client (lazy load on first use)
         self._calendar_client: Optional[CalendarClient] = None
@@ -67,7 +71,7 @@ class VoiceJournalAgent:
             try:
                 self._calendar_client = CalendarClient()
             except Exception as e:
-                print(f"[Calendar] Init error: {e}")
+                logger.warning(f"Calendar init error: {e}")
         return self._calendar_client
 
     async def process_input(self, text: str) -> Tuple[str, Optional[bytes]]:
@@ -92,7 +96,7 @@ class VoiceJournalAgent:
                 self._intent_router.detect, text, 0.5
             )
         except Exception as e:
-            print(f"[Intent Router] Error: {e}, falling back to keywords")
+            logger.warning(f"Intent router error: {e}, falling back to keywords")
             # Fallback to keyword matching
             text_lower = text.lower()
             if any(kw in text_lower for kw in self.LOG_KEYWORDS):
@@ -100,7 +104,7 @@ class VoiceJournalAgent:
             else:
                 intent, confidence = "chat", 0.5
 
-        print(f"[TIMING] Intent detection: {time.time() - intent_start:.2f}s -> {intent} ({confidence:.2f})")
+        logger.debug(f"Intent detection: {time.time() - intent_start:.2f}s -> {intent} ({confidence:.2f})")
 
         if intent == "log":
             # Extract content (remove common prefixes)
@@ -158,7 +162,7 @@ class VoiceJournalAgent:
             else:
                 return "Sorry, memory service is not available. Could you try again later?"
         except Exception as e:
-            print(f"Error saving entry: {e}")
+            logger.error(f"Error saving entry: {e}")
             return "Sorry, I had trouble saving that. Could you try again?"
     
     async def _handle_ask(self, result: IntentResult) -> str:
@@ -187,7 +191,7 @@ class VoiceJournalAgent:
                         max_turns=3
                     )
                 except Exception as e:
-                    print(f"[Working Memory] Error: {e}")
+                    logger.warning(f"Working memory error: {e}")
             return ""
 
         async def search_memories():
@@ -202,7 +206,7 @@ class VoiceJournalAgent:
                     distance_threshold=0.8
                 )
             except Exception as e:
-                print(f"[Memory Search] Error: {e}")
+                logger.warning(f"Memory search error: {e}")
                 return []
 
         async def fetch_calendar():
@@ -211,7 +215,7 @@ class VoiceJournalAgent:
                     # Run sync calendar API in thread pool to avoid blocking
                     return await asyncio.to_thread(self.calendar_client.get_calendar_context)
                 except Exception as e:
-                    print(f"[Calendar] Error: {e}")
+                    logger.warning(f"Calendar error: {e}")
             return ""
 
         # Execute in parallel
@@ -220,14 +224,14 @@ class VoiceJournalAgent:
             search_memories(),
             fetch_calendar()
         )
-        print(f"[TIMING] Parallel fetch: {time.time() - parallel_start:.2f}s (memories: {len(memories)}, calendar: {bool(calendar_context)})")
+        logger.debug(f"Parallel fetch: {time.time() - parallel_start:.2f}s (memories: {len(memories)}, calendar: {bool(calendar_context)})")
 
-        # Build context and generate response
-        journal_context = self._build_memory_context(memories) if memories else ""
+        # Build context - only use top result for speed
+        journal_context = self._get_top_memory(memories) if memories else ""
 
-        llm_start = time.time()
-        response = await self._generate_chat_response(query, journal_context, conversation_context, calendar_context)
-        print(f"[TIMING] LLM response: {time.time() - llm_start:.2f}s")
+        response_start = time.time()
+        response = await self._generate_response(query, journal_context, calendar_context)
+        logger.debug(f"Response (Ollama): {time.time() - response_start:.2f}s")
 
         self.state.last_entries_shown = [m.get("id", "") for m in memories] if memories else []
 
@@ -247,98 +251,70 @@ class VoiceJournalAgent:
                 assistant_response=assistant_response
             )
         except Exception as e:
-            print(f"[Working Memory] Background save error: {e}")
+            logger.warning(f"Working memory background save error: {e}")
 
-    def _build_memory_context(self, memories: List[Dict[str, Any]]) -> str:
-        """
-        Build a compact context pack from memory search results.
+    def _get_top_memory(self, memories: List[Dict[str, Any]]) -> str:
+        """Get only the top (most relevant) memory result."""
+        if not memories:
+            return ""
 
-        Format: bullet list with date + text snippet
-        """
-        lines = []
-        for memory in memories:
-            # Extract date from created_at
-            created_at = memory.get("created_at", "")
-            if created_at:
-                try:
-                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                    date_str = dt.strftime("%b %d")
-                except Exception:
-                    date_str = "Recent"
-            else:
-                date_str = "Recent"
+        memory = memories[0]  # Top result only
+        text = memory.get("text", "")
+        return text[:200] if len(text) > 200 else text
 
-            # Get text content (limit length for voice-first response)
-            text = memory.get("text", "")
-            if len(text) > 150:
-                text = text[:150] + "..."
-
-            lines.append(f"• {date_str}: {text}")
-
-        return "\n".join(lines)
-
-    async def _generate_chat_response(
+    async def _generate_response(
         self,
         query: str,
         journal_context: str,
-        conversation_context: str = "",
         calendar_context: str = ""
     ) -> str:
-        """Generate a natural response based on query, journal context, conversation history, and calendar."""
-        system_prompt = """You are a voice journal assistant with calendar access. Be brief and natural.
-- Max 2-3 sentences
-- Use journal entries and calendar events as context
-- For calendar queries, mention specific events and times
-- Maintain conversation flow"""
-
-        # Build compact prompt
-        parts = []
-        if conversation_context:
-            parts.append(f"Chat history:\n{conversation_context}")
+        """Generate natural response using Ollama."""
+        # Build context
+        context_parts = []
         if calendar_context:
-            parts.append(f"Calendar:\n{calendar_context}")
+            context_parts.append(f"Calendar: {calendar_context}")
         if journal_context:
-            parts.append(f"Journal:\n{journal_context}")
-        parts.append(f"User: {query}")
+            context_parts.append(f"Journal: {journal_context}")
 
-        user_prompt = "\n\n".join(parts)
+        if not context_parts:
+            return "I don't have any entries matching that. Try recording something first!"
 
-        response = await self._call_llm(
-            user_prompt,
-            system=system_prompt,
-            max_tokens=120
-        )
+        context = "\n".join(context_parts)
 
-        return response
+        prompt = f"""You are a voice journal assistant. Answer briefly in 1-2 sentences.
 
-    async def _call_llm(
-        self,
-        prompt: str,
-        system: str = "You are a helpful assistant.",
-        max_tokens: int = 150
-    ) -> str:
-        """Call OpenAI API for text generation."""
+Context:
+{context}
+
+User question: {query}
+
+Answer:"""
+
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    f"{OLLAMA_URL}/api/generate",
                     json={
-                        "model": "gpt-4o-mini",
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": prompt}
-                        ],
-                        "max_tokens": max_tokens,
-                        "temperature": 0.7
+                        "model": OLLAMA_MODEL,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "num_predict": 100,  # Keep responses short
+                            "temperature": 0.7
+                        }
                     },
-                    timeout=15.0
+                    timeout=10.0
                 )
                 data = response.json()
-                return data["choices"][0]["message"]["content"].strip()
+                return data.get("response", "").strip()
         except Exception as e:
-            print(f"LLM call failed: {e}")
-            return "I'm having trouble thinking right now. Could you try again?"
+            logger.error(f"Ollama error: {e}")
+            # Fallback to simple response
+            if calendar_context:
+                return f"Here's your schedule: {calendar_context}"
+            if journal_context:
+                return f"From your journal: {journal_context}"
+            return "Sorry, I couldn't process that."
 
     def get_mode(self) -> str:
         """Get current agent mode."""
