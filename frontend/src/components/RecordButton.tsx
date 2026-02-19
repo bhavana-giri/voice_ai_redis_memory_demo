@@ -7,6 +7,40 @@ interface RecordButtonProps {
   isDisabled?: boolean;
 }
 
+// Convert Float32Array PCM to 16-bit PCM WAV
+function encodeWAV(samples: Float32Array, sampleRate: number): ArrayBuffer {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);  // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    offset += 2;
+  }
+  return buffer;
+}
+
 export default function RecordButton({ onRecordingComplete, isDisabled }: RecordButtonProps) {
   const [isRecording, setIsRecording] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -17,6 +51,13 @@ export default function RecordButton({ onRecordingComplete, isDisabled }: Record
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationRef = useRef<number | null>(null);
 
+  // Web Audio API refs for WAV recording
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const audioBufferRef = useRef<Float32Array[]>([]);
+  const durationRef = useRef(0);
+
   useEffect(() => {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
@@ -26,38 +67,52 @@ export default function RecordButton({ onRecordingComplete, isDisabled }: Record
 
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      
-      // Set up audio analyser for visualization
-      const audioContext = new AudioContext();
+      // Request 16kHz mono audio for Sarvam AI
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true
+        }
+      });
+      mediaStreamRef.current = stream;
+
+      // Create AudioContext at 16kHz for Sarvam AI
+      const audioContext = new AudioContext({ sampleRate: 16000 });
+      audioContextRef.current = audioContext;
+
       const source = audioContext.createMediaStreamSource(stream);
+
+      // Set up audio analyser for visualization
       const analyser = audioContext.createAnalyser();
       analyser.fftSize = 256;
       source.connect(analyser);
       analyserRef.current = analyser;
 
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-      chunksRef.current = [];
+      // Use ScriptProcessorNode to capture raw PCM data
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+      audioBufferRef.current = [];
 
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        audioBufferRef.current.push(new Float32Array(inputData));
       };
 
-      mediaRecorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-        onRecordingComplete(blob, duration);
-        stream.getTracks().forEach(track => track.stop());
-        audioContext.close();
-      };
+      source.connect(processor);
+      processor.connect(audioContext.destination);
 
-      mediaRecorder.start(100);
       setIsRecording(true);
       setDuration(0);
+      durationRef.current = 0;
 
       // Duration timer
       timerRef.current = setInterval(() => {
-        setDuration(d => d + 1);
+        setDuration(d => {
+          durationRef.current = d + 1;
+          return d + 1;
+        });
       }, 1000);
 
       // Audio level visualization
@@ -76,14 +131,49 @@ export default function RecordButton({ onRecordingComplete, isDisabled }: Record
     }
   };
 
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      if (timerRef.current) clearInterval(timerRef.current);
-      if (animationRef.current) cancelAnimationFrame(animationRef.current);
-      setAudioLevel(0);
+  const stopRecording = async () => {
+    if (!isRecording) return;
+
+    setIsRecording(false);
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (animationRef.current) cancelAnimationFrame(animationRef.current);
+    setAudioLevel(0);
+
+    // Stop the processor and stream
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
     }
+
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(t => t.stop());
+      mediaStreamRef.current = null;
+    }
+
+    // Merge all audio chunks into single Float32Array
+    const totalLength = audioBufferRef.current.reduce((acc, chunk) => acc + chunk.length, 0);
+    const mergedSamples = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of audioBufferRef.current) {
+      mergedSamples.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    // Convert to WAV
+    const sampleRate = audioContextRef.current?.sampleRate || 16000;
+    const wavBuffer = encodeWAV(mergedSamples, sampleRate);
+
+    // Create WAV blob
+    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+
+    // Clean up AudioContext
+    if (audioContextRef.current) {
+      await audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+
+    // Call completion handler with duration
+    onRecordingComplete(blob, durationRef.current);
   };
 
   const formatDuration = (seconds: number) => {

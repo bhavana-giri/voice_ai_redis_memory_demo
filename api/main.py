@@ -26,7 +26,7 @@ from src.voice_agent import VoiceJournalAgent
 
 # Global clients
 memory_client: Optional[MemoryClient] = None
-agents: Dict[str, VoiceJournalAgent] = {}  # user_id -> agent
+agents: Dict[str, VoiceJournalAgent] = {}  # (user_id, session_id) -> agent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -102,49 +102,84 @@ async def health_check():
 async def transcribe_audio(request: TranscribeRequest):
     """Transcribe audio using Sarvam AI and store in memory."""
     try:
+        import time
+        stt_start = time.time()
+
         # Decode base64 audio
         audio_data = base64.b64decode(request.audio_base64)
 
-        # Save to temp file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(audio_data)
-            temp_path = f.name
+        # Browser MediaRecorder sends webm/opus, not WAV
+        # Detect format by checking magic bytes
+        is_wav = audio_data[:4] == b'RIFF' and audio_data[8:12] == b'WAVE'
 
-        try:
-            transcript, language_code, request_id = audio_handler.transcribe(
-                temp_path,
-                language_code=request.language_code
-            )
+        if is_wav:
+            # WAV format: use WebSocket streaming for lower latency
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                f.write(audio_data)
+                temp_path = f.name
 
-            # Generate session ID if not provided
-            session_id = request.session_id or str(uuid.uuid4())
+            try:
+                transcript, language_code = await audio_handler.transcribe_stream(
+                    temp_path, language_code=request.language_code
+                )
+                print(f"[TIMING] STT (streaming): {time.time() - stt_start:.2f}s")
+            finally:
+                os.unlink(temp_path)
+        else:
+            # Non-WAV format (browser webm/opus): use REST API (auto-detects format)
+            print(f"[DEBUG] Non-WAV audio, first bytes: {audio_data[:12]}, using REST API")
 
-            # Store in Redis Agent Memory Server (long-term memory for retrieval)
-            memory_entry = None
-            if request.store_in_memory and memory_client:
-                try:
-                    memory_entry = await memory_client.create_journal_memory(
-                        user_id=request.user_id,
-                        transcript=transcript,
-                        language_code=language_code,
-                        topics=["journal", "voice_entry"],
-                        session_id=session_id
-                    )
-                    print(f"[OK] Stored voice entry in long-term memory: {memory_entry.get('memory_id', 'unknown')}")
-                except Exception as mem_err:
-                    print(f"[WARN] Failed to store in memory: {mem_err}")
+            # Determine extension from magic bytes
+            if audio_data[:4] == b'\x1aE\xdf\xa3':  # webm magic bytes
+                suffix = ".webm"
+            elif audio_data[:3] == b'ID3' or audio_data[:2] == b'\xff\xfb':  # mp3
+                suffix = ".mp3"
+            elif audio_data[:4] == b'OggS':  # ogg
+                suffix = ".ogg"
+            else:
+                suffix = ".webm"  # default to webm for browser audio
 
-            return {
-                "transcript": transcript,
-                "language_code": language_code,
-                "request_id": request_id,
-                "session_id": session_id,
-                "stored_in_memory": memory_entry is not None,
-                "memory_entry": memory_entry
-            }
-        finally:
-            os.unlink(temp_path)
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+                f.write(audio_data)
+                temp_path = f.name
+
+            try:
+                # REST API handles format detection automatically
+                transcript, language_code, _ = audio_handler.transcribe(
+                    temp_path, language_code=request.language_code
+                )
+                print(f"[TIMING] STT (REST): {time.time() - stt_start:.2f}s")
+            finally:
+                os.unlink(temp_path)
+
+        # Generate session ID if not provided
+        session_id = request.session_id or str(uuid.uuid4())
+
+        # Store in Redis Agent Memory Server (long-term memory for retrieval)
+        memory_entry = None
+        if request.store_in_memory and memory_client:
+            try:
+                memory_entry = await memory_client.create_journal_memory(
+                    user_id=request.user_id,
+                    transcript=transcript,
+                    language_code=language_code,
+                    topics=["journal", "voice_entry"],
+                    session_id=session_id
+                )
+                print(f"[OK] Stored voice entry in long-term memory: {memory_entry.get('memory_id', 'unknown')}")
+            except Exception as mem_err:
+                print(f"[WARN] Failed to store in memory: {mem_err}")
+
+        return {
+            "transcript": transcript,
+            "language_code": language_code,
+            "session_id": session_id,
+            "stored_in_memory": memory_entry is not None,
+            "memory_entry": memory_entry
+        }
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -279,6 +314,7 @@ class AgentChatRequest(BaseModel):
     text: Optional[str] = None
     audio_base64: Optional[str] = None
     user_id: str = "default_user"
+    session_id: Optional[str] = None  # For working memory / conversation continuity
     language_code: Optional[str] = None
 
 
@@ -289,15 +325,22 @@ class AgentChatResponse(BaseModel):
     mode: str
     audio_base64: Optional[str] = None
     entry_count: int
-    transcribed_text: Optional[str] = None  # For debugging STT = 0
+    session_id: str  # Return session_id for frontend to persist
+    transcribed_text: Optional[str] = None  # For debugging STT
 
 
-def get_or_create_agent(user_id: str) -> VoiceJournalAgent:
-    """Get or create an agent for a user."""
-    if user_id not in agents:
+def get_or_create_agent(user_id: str, session_id: str) -> VoiceJournalAgent:
+    """Get or create an agent for a user and session."""
+    agent_key = f"{user_id}:{session_id}"
+    if agent_key not in agents:
         # Pass memory_client for searching long-term memory (memory_idx)
-        agents[user_id] = VoiceJournalAgent(user_id=user_id, memory_client=memory_client)
-    return agents[user_id]
+        # Pass session_id for working memory (conversation continuity)
+        agents[agent_key] = VoiceJournalAgent(
+            user_id=user_id,
+            session_id=session_id,
+            memory_client=memory_client
+        )
+    return agents[agent_key]
 
 
 @app.post("/api/agent/chat", response_model=AgentChatResponse)
@@ -308,46 +351,110 @@ async def agent_chat(request: AgentChatRequest):
     Accepts either text or audio input.
     Returns response text and optional TTS audio.
     """
-    text = request.text
+    import time
+    timings = {}
+    total_start = time.time()
 
+    text = request.text
     transcribed_text = None  # Track what was transcribed from audio
 
     # If audio provided, transcribe first
     if request.audio_base64 and not text:
         try:
+            stt_start = time.time()
             audio_data = base64.b64decode(request.audio_base64)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                f.write(audio_data)
-                temp_path = f.name
 
-            try:
-                transcript, lang_code, _ = audio_handler.transcribe(
-                    temp_path, language_code=request.language_code
-                )
-                text = transcript
-                transcribed_text = transcript
-                print(f"[STT] Transcribed: '{transcript}' (lang: {lang_code})")
-            finally:
-                os.unlink(temp_path)
+            # Browser MediaRecorder sends webm/opus, not WAV
+            # Detect format by checking magic bytes
+            is_wav = audio_data[:4] == b'RIFF' and audio_data[8:12] == b'WAVE'
+
+            if is_wav:
+                # WAV format: use WebSocket streaming for lower latency
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                    f.write(audio_data)
+                    temp_path = f.name
+
+                try:
+                    transcript, lang_code = await audio_handler.transcribe_stream(
+                        temp_path, language_code=request.language_code
+                    )
+                    text = transcript
+                    transcribed_text = transcript
+                    timings['stt'] = time.time() - stt_start
+                    print(f"[TIMING] STT (streaming): {timings['stt']:.2f}s - '{transcript}'")
+                finally:
+                    os.unlink(temp_path)
+            else:
+                # Non-WAV format (browser webm/opus): use REST API (auto-detects format)
+                print(f"[DEBUG] Non-WAV audio, first bytes: {audio_data[:12]}, using REST API")
+
+                # Determine extension from magic bytes
+                if audio_data[:4] == b'\x1aE\xdf\xa3':  # webm magic bytes
+                    suffix = ".webm"
+                elif audio_data[:3] == b'ID3' or audio_data[:2] == b'\xff\xfb':  # mp3
+                    suffix = ".mp3"
+                elif audio_data[:4] == b'OggS':  # ogg
+                    suffix = ".ogg"
+                else:
+                    suffix = ".webm"  # default to webm for browser audio
+
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+                    f.write(audio_data)
+                    temp_path = f.name
+
+                try:
+                    # REST API handles format detection automatically
+                    transcript, lang_code, _ = audio_handler.transcribe(
+                        temp_path, language_code=request.language_code
+                    )
+                    text = transcript
+                    transcribed_text = transcript
+                    timings['stt'] = time.time() - stt_start
+                    print(f"[TIMING] STT (REST): {timings['stt']:.2f}s - '{transcript}'")
+                finally:
+                    os.unlink(temp_path)
+
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             raise HTTPException(status_code=400, detail=f"Audio transcription failed: {e}")
 
     if not text:
         raise HTTPException(status_code=400, detail="Either text or audio_base64 is required")
 
+    # Generate session_id if not provided (for working memory / conversation continuity)
+    session_id = request.session_id or f"session_{uuid.uuid4().hex[:12]}"
+
     # Get agent and process
-    agent = get_or_create_agent(request.user_id)
+    agent = get_or_create_agent(request.user_id, session_id)
 
     try:
+        agent_start = time.time()
         response_text, _ = await agent.process_input(text)
+        timings['agent'] = time.time() - agent_start
+        print(f"[TIMING] Agent processing: {timings['agent']:.2f}s")
 
-        # Get TTS audio for response
+        # Get TTS audio for response (using streaming for faster first-byte)
         audio_base64 = None
         try:
-            audio_bytes = audio_handler.text_to_speech(response_text, "en-IN", "shubh")
+            tts_start = time.time()
+            # Use streaming TTS for lower latency
+            audio_bytes = await audio_handler.text_to_speech_stream_full(
+                response_text, "en-IN", "shubh"
+            )
             audio_base64 = base64.b64encode(audio_bytes).decode()
+            timings['tts'] = time.time() - tts_start
+            print(f"[TIMING] TTS (streaming): {timings['tts']:.2f}s")
         except Exception as tts_err:
-            print(f"TTS failed: {tts_err}")
+            print(f"TTS streaming failed, trying non-streaming: {tts_err}")
+            # Fallback to non-streaming
+            try:
+                audio_bytes = audio_handler.text_to_speech(response_text, "en-IN", "shubh")
+                audio_base64 = base64.b64encode(audio_bytes).decode()
+                timings['tts'] = time.time() - tts_start
+                print(f"[TIMING] TTS (fallback): {timings['tts']:.2f}s")
+            except Exception as e2:
+                print(f"TTS fallback also failed: {e2}")
 
         # Get current entry count
         entry_count = agent.store.get_entry_count(request.user_id)
@@ -356,12 +463,16 @@ async def agent_chat(request: AgentChatRequest):
         intent_result = agent.intent_detector._rule_based_detect(text)
         intent_str = intent_result.intent.value if intent_result else "unknown"
 
+        timings['total'] = time.time() - total_start
+        print(f"[TIMING] TOTAL: {timings['total']:.2f}s | STT: {timings.get('stt', 0):.2f}s | Agent: {timings.get('agent', 0):.2f}s | TTS: {timings.get('tts', 0):.2f}s")
+
         return AgentChatResponse(
             response=response_text,
             intent=intent_str,
             mode=agent.get_mode(),
             audio_base64=audio_base64,
             entry_count=entry_count,
+            session_id=session_id,
             transcribed_text=transcribed_text
         )
     except Exception as e:
@@ -371,19 +482,19 @@ async def agent_chat(request: AgentChatRequest):
 
 
 @app.get("/api/agent/mode")
-def get_agent_mode(user_id: str = "default_user"):
+def get_agent_mode(user_id: str = "default_user", session_id: str = "default_session"):
     """Get current agent mode."""
-    agent = get_or_create_agent(user_id)
+    agent = get_or_create_agent(user_id, session_id)
     return {"mode": agent.get_mode(), "user_id": user_id}
 
 
 @app.post("/api/agent/mode")
-def set_agent_mode(user_id: str = "default_user", mode: str = "log"):
+def set_agent_mode(user_id: str = "default_user", session_id: str = "default_session", mode: str = "log"):
     """Set agent mode (log or chat)."""
     if mode not in ("log", "chat"):
         raise HTTPException(status_code=400, detail="Mode must be 'log' or 'chat'")
 
-    agent = get_or_create_agent(user_id)
+    agent = get_or_create_agent(user_id, session_id)
     agent.set_mode(mode)
     return {"mode": agent.get_mode(), "user_id": user_id}
 

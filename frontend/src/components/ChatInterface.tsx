@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 
 interface Message {
   id: string;
@@ -17,7 +17,52 @@ interface ChatInterfaceProps {
 
 const API_BASE_URL = 'http://localhost:8080';
 
+// Generate a unique session ID
+function generateSessionId(): string {
+  return `session_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+}
+
+// Convert Float32Array PCM to 16-bit PCM WAV
+function encodeWAV(samples: Float32Array, sampleRate: number): ArrayBuffer {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  // WAV header
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM chunk size
+  view.setUint16(20, 1, true);  // PCM format
+  view.setUint16(22, 1, true);  // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true);  // block align
+  view.setUint16(34, 16, true); // bits per sample
+  writeString(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+
+  // Convert float samples to 16-bit PCM
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    offset += 2;
+  }
+
+  return buffer;
+}
+
 export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
+  // Generate session_id once when component mounts (for conversation continuity)
+  const [sessionId, setSessionId] = useState<string>(() => generateSessionId());
+
   const [messages, setMessages] = useState<Message[]>([
     {
       id: '1',
@@ -35,6 +80,12 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
 
+  // Web Audio API refs for WAV recording
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const audioBufferRef = useRef<Float32Array[]>([]);
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
@@ -45,7 +96,7 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
-      content: text || '🎤 Voice message',
+      content: text || 'Voice message',
       timestamp: new Date()
     };
     setMessages(prev => [...prev, userMessage]);
@@ -59,11 +110,17 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
         body: JSON.stringify({
           text: text || undefined,
           audio_base64: audioBase64,
-          user_id: 'default_user'
+          user_id: 'default_user',
+          session_id: sessionId  // Include session_id for conversation continuity
         })
       });
 
       const data = await response.json();
+
+      // Update session_id if returned from server (for new sessions)
+      if (data.session_id && data.session_id !== sessionId) {
+        setSessionId(data.session_id);
+      }
 
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
@@ -100,36 +157,95 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
 
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
+      // Request 16kHz mono audio for Sarvam AI
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true
+        }
+      });
+      mediaStreamRef.current = stream;
 
-      mediaRecorder.ondataavailable = (e) => {
-        audioChunksRef.current.push(e.data);
+      // Create AudioContext at 16kHz for Sarvam AI
+      const audioContext = new AudioContext({ sampleRate: 16000 });
+      audioContextRef.current = audioContext;
+
+      const source = audioContext.createMediaStreamSource(stream);
+
+      // Use ScriptProcessorNode to capture raw PCM data
+      // Buffer size 4096 gives good balance of latency and efficiency
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+      audioBufferRef.current = [];
+
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        // Clone the data since the buffer gets reused
+        audioBufferRef.current.push(new Float32Array(inputData));
       };
 
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          sendMessage('', base64);
-        };
-        reader.readAsDataURL(audioBlob);
-        stream.getTracks().forEach(t => t.stop());
-      };
+      source.connect(processor);
+      processor.connect(audioContext.destination);
 
-      mediaRecorder.start();
       setIsRecording(true);
     } catch (err) {
       console.error('Recording error:', err);
     }
   };
 
-  const stopRecording = () => {
-    mediaRecorderRef.current?.stop();
+  const stopRecording = async () => {
     setIsRecording(false);
+
+    // Stop the processor and stream
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(t => t.stop());
+      mediaStreamRef.current = null;
+    }
+
+    // Merge all audio chunks into single Float32Array
+    const totalLength = audioBufferRef.current.reduce((acc, chunk) => acc + chunk.length, 0);
+    const mergedSamples = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of audioBufferRef.current) {
+      mergedSamples.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    // Convert to WAV
+    const sampleRate = audioContextRef.current?.sampleRate || 16000;
+    const wavBuffer = encodeWAV(mergedSamples, sampleRate);
+
+    // Convert to base64
+    const base64 = btoa(
+      new Uint8Array(wavBuffer).reduce((data, byte) => data + String.fromCharCode(byte), '')
+    );
+
+    // Clean up AudioContext
+    if (audioContextRef.current) {
+      await audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+
+    // Send the WAV audio
+    sendMessage('', base64);
+  };
+
+  // Start a new chat session (reset conversation)
+  const startNewChat = () => {
+    setSessionId(generateSessionId());
+    setMessages([{
+      id: '1',
+      role: 'assistant',
+      content: "Hi! I'm your voice journal assistant. You can log notes, ask about past entries, or get summaries. How can I help?",
+      timestamp: new Date()
+    }]);
   };
 
   if (!isOpen) return null;
@@ -143,16 +259,25 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
             <h2 className="text-lg font-semibold text-gray-800">Voice Journal</h2>
             <div className="flex items-center gap-2 mt-1">
               <span className={`px-2 py-0.5 text-xs rounded-full ${mode === 'chat' ? 'bg-purple-100 text-purple-700' : 'bg-green-100 text-green-700'}`}>
-                {mode === 'chat' ? '💬 Chat' : '📝 Log'} mode
+                {mode === 'chat' ? 'Chat' : 'Log'} mode
               </span>
               <span className="text-xs text-gray-500">{entryCount} entries</span>
             </div>
           </div>
-          <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-full transition-colors">
-            <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={startNewChat}
+              className="px-3 py-1.5 text-xs bg-purple-100 text-purple-700 rounded-full hover:bg-purple-200 transition-colors"
+              title="Start a new conversation"
+            >
+              New Chat
+            </button>
+            <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-full transition-colors">
+              <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
         </div>
 
         {/* Messages */}

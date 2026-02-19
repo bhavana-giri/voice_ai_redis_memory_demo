@@ -62,6 +62,10 @@ ASK_PATTERNS = [
     r"find (entries|notes|recordings) (about|with|containing)",
     r"search (for|my) (entries|notes|journal)",
     r"do i have any (notes|entries) (about|on|regarding)",
+    # Question words - general questions are ASK_JOURNAL
+    r"^(what|when|where|who|how|why|which|did|do|does|is|are|was|were|has|have|can|could|will|would)\b.*\??\s*$",
+    r"^tell me (about|what|when|where)",
+    r"^(show|give) me",
 ]
 
 SUMMARIZE_PATTERNS = [
@@ -108,8 +112,8 @@ HELP_PATTERNS = [
 
 class IntentDetector:
     """Detect user intent from text."""
-    
-    def __init__(self, use_llm: bool = True):
+
+    def __init__(self, use_llm: bool = False):  # Disabled LLM by default for speed
         self.use_llm = use_llm
         self.api_key = os.getenv("OPENAI_API_KEY")
     

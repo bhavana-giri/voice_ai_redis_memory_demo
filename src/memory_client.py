@@ -245,7 +245,10 @@ class MemoryClient:
         Returns:
             List of memory records with text, distance, and metadata
         """
+        import time
+        t0 = time.time()
         client = await self._get_client()
+        print(f"[TIMING] Memory client get: {time.time() - t0:.2f}s")
 
         try:
             # Import filter classes
@@ -254,12 +257,14 @@ class MemoryClient:
             # Build user_id filter if provided
             user_filter = UserId(eq=user_id) if user_id else None
 
+            t1 = time.time()
             results = await client.search_long_term_memory(
                 text=query,
                 user_id=user_filter,
                 limit=limit,
                 distance_threshold=distance_threshold
             )
+            print(f"[TIMING] Memory search API call: {time.time() - t1:.2f}s")
 
             # Convert to list of dicts
             memories = []
@@ -321,4 +326,168 @@ class MemoryClient:
                 "memories": [],
                 "total": 0
             }
+
+    async def save_conversation_turn(
+        self,
+        session_id: str,
+        user_id: str,
+        user_message: str,
+        assistant_response: str
+    ) -> bool:
+        """
+        Save a conversation turn (user message + assistant response) to working memory.
+
+        This enables conversational continuity by storing the conversation history
+        which can be retrieved later to maintain context.
+
+        Args:
+            session_id: Unique session identifier
+            user_id: User identifier
+            user_message: The user's message
+            assistant_response: The assistant's response
+
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        client = await self._get_client()
+        now = datetime.now(timezone.utc)
+
+        try:
+            # Create messages for both user and assistant
+            messages = [
+                MemoryMessage(role="user", content=user_message, created_at=now),
+                MemoryMessage(role="assistant", content=assistant_response, created_at=now)
+            ]
+
+            # Ensure working memory exists for this session
+            await client.get_or_create_working_memory(
+                session_id=session_id,
+                user_id=user_id
+            )
+
+            # Append the conversation turn
+            await client.append_messages_to_working_memory(
+                session_id=session_id,
+                messages=messages,
+                user_id=user_id
+            )
+
+            print(f"[Working Memory] Saved conversation turn - Session: {session_id}")
+            return True
+
+        except Exception as e:
+            print(f"[Working Memory] Error saving turn: {e}")
+            return False
+
+    async def get_conversation_context(
+        self,
+        session_id: str,
+        user_id: str,
+        max_turns: int = 10
+    ) -> str:
+        """
+        Get formatted conversation context from working memory for LLM prompts.
+
+        Returns the recent conversation history formatted as a string that can
+        be included in LLM system/user prompts for conversational continuity.
+
+        Args:
+            session_id: Unique session identifier
+            user_id: User identifier
+            max_turns: Maximum number of message pairs to include
+
+        Returns:
+            Formatted conversation history string, or empty string if no history
+        """
+        import time
+        t0 = time.time()
+        client = await self._get_client()
+        print(f"[TIMING] Working memory client get: {time.time() - t0:.2f}s")
+
+        try:
+            t1 = time.time()
+            _, working_memory = await client.get_or_create_working_memory(
+                session_id=session_id,
+                user_id=user_id
+            )
+            print(f"[TIMING] Working memory API call: {time.time() - t1:.2f}s")
+
+            if not working_memory.messages:
+                return ""
+
+            # Get recent messages (limit to max_turns * 2 for user+assistant pairs)
+            recent_messages = working_memory.messages[-(max_turns * 2):]
+
+            # Format as conversation history
+            lines = []
+            for msg in recent_messages:
+                role_label = "User" if msg.role == "user" else "Assistant"
+                lines.append(f"{role_label}: {msg.content}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            print(f"[Working Memory] Error getting context: {e}")
+            return ""
+
+    async def get_combined_context(
+        self,
+        session_id: str,
+        user_id: str,
+        query: str,
+        max_conversation_turns: int = 5,
+        max_long_term_results: int = 5
+    ) -> Tuple[str, str]:
+        """
+        Get both conversation context and relevant long-term memories.
+
+        This is useful for building rich context for LLM prompts that includes
+        both the recent conversation and relevant past journal entries.
+
+        Args:
+            session_id: Unique session identifier
+            user_id: User identifier
+            query: Current query to search long-term memory
+            max_conversation_turns: Max conversation turns to include
+            max_long_term_results: Max long-term memory results
+
+        Returns:
+            Tuple of (conversation_context, long_term_context)
+        """
+        # Get conversation history from working memory
+        conversation_context = await self.get_conversation_context(
+            session_id=session_id,
+            user_id=user_id,
+            max_turns=max_conversation_turns
+        )
+
+        # Search long-term memory for relevant entries
+        memories = await self.search_long_term_memory(
+            query=query,
+            user_id=user_id,
+            limit=max_long_term_results,
+            distance_threshold=0.8
+        )
+
+        # Format long-term memories
+        long_term_lines = []
+        for memory in memories:
+            created_at = memory.get("created_at", "")
+            if created_at:
+                try:
+                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    date_str = dt.strftime("%b %d")
+                except Exception:
+                    date_str = "Recent"
+            else:
+                date_str = "Recent"
+
+            text = memory.get("text", "")
+            if len(text) > 150:
+                text = text[:150] + "..."
+            long_term_lines.append(f"- {date_str}: {text}")
+
+        long_term_context = "\n".join(long_term_lines) if long_term_lines else ""
+
+        return conversation_context, long_term_context
 

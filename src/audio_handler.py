@@ -4,10 +4,11 @@ import wave
 import base64
 import tempfile
 import subprocess
+import asyncio
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, AsyncGenerator
 import pyaudio
-from sarvamai import SarvamAI
+from sarvamai import SarvamAI, AsyncSarvamAI, AudioOutput, EventResponse
 from sarvamai.core.api_error import ApiError
 from dotenv import load_dotenv
 
@@ -16,16 +17,17 @@ load_dotenv()
 
 class AudioHandler:
     """Handles audio recording, STT, and TTS using Sarvam AI."""
-    
+
     # Audio recording settings
     FORMAT = pyaudio.paInt16
     CHANNELS = 1
     RATE = 16000  # 16kHz for speech
     CHUNK = 1024
-    
+
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("SARVAM_API_KEY")
         self.client = SarvamAI(api_subscription_key=self.api_key)
+        self.async_client = AsyncSarvamAI(api_subscription_key=self.api_key)
         self.recordings_dir = "recordings"
         os.makedirs(self.recordings_dir, exist_ok=True)
     
@@ -139,15 +141,192 @@ class AudioHandler:
         audio_base64 = response.audios[0]
         return base64.b64decode(audio_base64)
     
+    async def text_to_speech_stream(
+        self,
+        text: str,
+        language_code: str = "en-IN",
+        speaker: str = "shubh"
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Stream text-to-speech using WebSocket for lower latency.
+
+        Yields audio chunks as they are generated, allowing playback
+        to start before the full audio is ready.
+
+        Args:
+            text: Text to convert
+            language_code: Target language code
+            speaker: Speaker voice name
+
+        Yields:
+            Audio bytes chunks (MP3 format)
+        """
+        import time
+        t0 = time.time()
+        first_chunk = True
+        chunk_count = 0
+
+        try:
+            # IMPORTANT: send_completion_event=True is REQUIRED to receive the "final" event
+            # Without it, the WebSocket never signals completion and hangs forever
+            async with self.async_client.text_to_speech_streaming.connect(
+                model="bulbul:v3",
+                send_completion_event=True  # This enables the "final" event signal
+            ) as ws:
+                # Configure the stream
+                await ws.configure(
+                    target_language_code=language_code,
+                    speaker=speaker,
+                    output_audio_codec="mp3",
+                    pace=1.1  # Slightly faster for natural conversation
+                )
+
+                # Send text for conversion
+                await ws.convert(text)
+                await ws.flush()
+
+                # Yield audio chunks as they arrive
+                # EventResponse with event_type="final" signals completion
+                async for message in ws:
+                    if isinstance(message, AudioOutput):
+                        chunk = base64.b64decode(message.data.audio)
+                        chunk_count += 1
+                        if first_chunk:
+                            print(f"[TIMING] TTS first chunk: {time.time() - t0:.2f}s")
+                            first_chunk = False
+                        yield chunk
+                    elif isinstance(message, EventResponse):
+                        # This is the completion signal - break the loop
+                        if hasattr(message, 'data') and hasattr(message.data, 'event_type'):
+                            if message.data.event_type == "final":
+                                print(f"[TTS Stream] Received final event")
+                                break
+
+                print(f"[TIMING] TTS stream complete: {chunk_count} chunks in {time.time() - t0:.2f}s")
+
+        except Exception as e:
+            print(f"[TTS Stream] Error: {e}")
+            # Fall back to non-streaming TTS
+            audio = self.text_to_speech(text, language_code, speaker)
+            yield audio
+
+    async def text_to_speech_stream_full(
+        self,
+        text: str,
+        language_code: str = "en-IN",
+        speaker: str = "shubh",
+        timeout: float = 10.0
+    ) -> bytes:
+        """
+        Stream TTS but return complete audio bytes with timeout protection.
+
+        Uses streaming for faster time-to-first-byte, but collects
+        all chunks and returns complete audio.
+        """
+        import time
+        t0 = time.time()
+        chunks = []
+
+        try:
+            async for chunk in self.text_to_speech_stream(text, language_code, speaker):
+                chunks.append(chunk)
+                # Check timeout after each chunk
+                if time.time() - t0 > timeout:
+                    print(f"[TTS Stream] Timeout after {timeout}s with {len(chunks)} chunks")
+                    break
+
+            if chunks:
+                return b"".join(chunks)
+            else:
+                # No chunks received, fall back
+                raise Exception("No audio chunks received")
+
+        except Exception as e:
+            print(f"[TTS Stream] Error: {e}, falling back to REST API")
+            return self.text_to_speech(text, language_code, speaker)
+
+    async def transcribe_stream(
+        self,
+        audio_file: str,
+        mode: str = "transcribe",
+        language_code: Optional[str] = None,
+        timeout: float = 10.0
+    ) -> Tuple[str, str]:
+        """
+        Transcribe audio using WebSocket streaming for lower latency.
+
+        Args:
+            audio_file: Path to audio file
+            mode: transcribe, translate, verbatim, or transliterate
+            language_code: Optional language code hint
+            timeout: Max seconds to wait for response
+
+        Returns:
+            Tuple of (transcript, language_code)
+        """
+        import time
+        t0 = time.time()
+
+        # Read and encode audio file
+        with open(audio_file, "rb") as f:
+            audio_data = base64.b64encode(f.read()).decode("utf-8")
+
+        try:
+            # Build connection params - language_code is REQUIRED for WebSocket API
+            # Default to "en-IN" if not provided (auto-detection not supported in streaming)
+            connect_params = {
+                "model": "saaras:v3",
+                "mode": mode,
+                "language_code": language_code or "en-IN",  # Required parameter
+                "high_vad_sensitivity": True,
+                "flush_signal": True,  # Enable manual flush for faster response
+            }
+
+            async with self.async_client.speech_to_text_streaming.connect(
+                **connect_params
+            ) as ws:
+                # Send audio for transcription FIRST
+                await ws.transcribe(
+                    audio=audio_data,
+                    encoding="audio/wav",
+                    sample_rate=16000
+                )
+
+                # Force immediate processing
+                await ws.flush()
+
+                print(f"[TIMING] STT audio sent: {time.time() - t0:.2f}s")
+
+                # Use async for iteration pattern (the __aiter__ method in SDK)
+                # This is the correct pattern - sends audio first, then iterates for response
+                async for message in ws:
+                    print(f"[TIMING] STT response received: {time.time() - t0:.2f}s")
+
+                    # Extract transcript from response
+                    # Response has: type='data', data.transcript='...'
+                    if hasattr(message, 'data') and hasattr(message.data, 'transcript'):
+                        transcript = message.data.transcript
+                        detected_lang = getattr(message.data, 'language_code', None) or language_code or "en-IN"
+                        if transcript:
+                            return transcript, detected_lang
+
+                raise Exception("No transcript received from WebSocket")
+
+        except Exception as e:
+            print(f"[STT Stream] Error: {e}, falling back to REST API")
+            # Fall back to non-streaming STT
+            transcript, lang_code, _ = self.transcribe(audio_file, mode, language_code)
+            return transcript, lang_code
+
     def speak(self, text: str, language_code: str = "en-IN", speaker: str = "shubh"):
         """Convert text to speech and play it."""
         audio_bytes = self.text_to_speech(text, language_code, speaker)
-        
+
         # Save to temp file and play
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             f.write(audio_bytes)
             temp_path = f.name
-        
+
         try:
             subprocess.run(["afplay", temp_path], check=True, capture_output=True)
         except Exception:
