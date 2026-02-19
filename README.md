@@ -8,6 +8,8 @@
 
 AI-powered voice journaling application that demonstrates how **Redis Agent Memory Server** enables long-term memory and semantic search, allowing the agent to remember your journal entries across sessions and provide personalized responses.
 
+![Voice Journal App](assets/app-screenshot.png)
+
 ## Table of Contents
 
 - [Features](#features)
@@ -167,21 +169,23 @@ flowchart LR
         ROUTER[RedisVL<br/>Intent Router]
     end
 
-    subgraph Memory["Redis Agent Memory Server"]
-        WM[Working Memory]
-        LTM[Long-term Memory]
+    subgraph AMS["Agent Memory Server"]
+        API[Memory API]
     end
 
-    subgraph Storage["Redis Cloud"]
-        VEC[(Vectors)]
+    subgraph Redis["Redis Cloud"]
+        WM[Working Memory]
+        LTM[Long-term Memory]
+        VEC[(Vector Index)]
     end
 
     MIC --> FE --> BE
     BE --> STT --> AGENT
     AGENT --> ROUTER
     AGENT --> LLM
-    AGENT <--> WM
-    AGENT <--> LTM
+    AGENT <--> API
+    API <-->|manages| WM
+    API <-->|manages| LTM
     WM --> VEC
     LTM --> VEC
     AGENT --> TTS --> BE --> FE --> SPEAKER
