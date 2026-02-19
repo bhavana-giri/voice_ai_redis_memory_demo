@@ -4,7 +4,6 @@ import { useState } from 'react';
 import Sidebar from '@/components/Sidebar';
 import SearchBar from '@/components/SearchBar';
 import EntryCard from '@/components/EntryCard';
-import StatsCard from '@/components/StatsCard';
 import RecordingModal from '@/components/RecordingModal';
 import ChatInterface from '@/components/ChatInterface';
 import { JournalEntry, PlaybackState } from '@/types';
@@ -31,7 +30,7 @@ const mockEntries: JournalEntry[] = [
   },
   {
     id: '3',
-    transcript: 'आज मैंने हिंदी में अपनी पहली जर्नल एंट्री रिकॉर्ड की। यह बहुत अच्छा अनुभव था।',
+    transcript: 'Guess what? Voice journal के साथ हिंदी में journal entry करना बहुत easy है!',
     language_code: 'hi-IN',
     created_at: new Date(Date.now() - 86400000).toISOString(),
     duration_seconds: 28,
@@ -46,6 +45,8 @@ export default function Home() {
   const [entries, setEntries] = useState<JournalEntry[]>(mockEntries);
   const [isRecordingModalOpen, setIsRecordingModalOpen] = useState(false);
   const [isChatOpen, setIsChatOpen] = useState(false);
+  const [selectedMood, setSelectedMood] = useState<string | null>(null);
+  const [moodSaving, setMoodSaving] = useState(false);
   const [playback, setPlayback] = useState<PlaybackState>({
     isPlaying: false,
     currentTime: 0,
@@ -71,6 +72,32 @@ export default function Home() {
   };
 
   const handleFavorite = (entryId: string) => console.log('Favorite:', entryId);
+
+  const handleMoodSelect = async (mood: string, emoji: string) => {
+    if (moodSaving) return;
+
+    setMoodSaving(true);
+    setSelectedMood(mood);
+
+    try {
+      const response = await fetch('http://localhost:8080/api/mood', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mood, emoji, user_id: 'default_user' }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to save mood');
+      }
+
+      console.log('Mood saved:', mood, emoji);
+    } catch (error) {
+      console.error('Error saving mood:', error);
+      setSelectedMood(null);
+    } finally {
+      setMoodSaving(false);
+    }
+  };
 
   const handleSaveRecording = (
     audioBlob: Blob,
@@ -124,11 +151,30 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="grid grid-cols-4 gap-4 mb-6">
-            <StatsCard title="Total Entries" value={entries.length} icon="📝" change="+3" changeType="positive" colorClass="bg-purple-100" />
-            <StatsCard title="This Week" value="12" icon="📅" change="+5" changeType="positive" colorClass="bg-yellow-100" />
-            <StatsCard title="Total Duration" value="2h 15m" icon="⏱️" colorClass="bg-orange-100" />
-            <StatsCard title="Streak" value="7 days" icon="🔥" change="Best!" changeType="positive" colorClass="bg-green-100" />
+          <div className="mb-6">
+            <p className="text-sm text-gray-600 mb-3">How are you feeling today?</p>
+            <div className="flex gap-3">
+              {[
+                { emoji: '😊', label: 'Happy', color: 'bg-yellow-100 hover:bg-yellow-200 border-yellow-300', selectedColor: 'bg-yellow-300 border-yellow-500 ring-2 ring-yellow-400' },
+                { emoji: '😢', label: 'Sad', color: 'bg-blue-100 hover:bg-blue-200 border-blue-300', selectedColor: 'bg-blue-300 border-blue-500 ring-2 ring-blue-400' },
+                { emoji: '🤩', label: 'Excited', color: 'bg-pink-100 hover:bg-pink-200 border-pink-300', selectedColor: 'bg-pink-300 border-pink-500 ring-2 ring-pink-400' },
+                { emoji: '😌', label: 'Calm', color: 'bg-green-100 hover:bg-green-200 border-green-300', selectedColor: 'bg-green-300 border-green-500 ring-2 ring-green-400' },
+                { emoji: '😤', label: 'Frustrated', color: 'bg-red-100 hover:bg-red-200 border-red-300', selectedColor: 'bg-red-300 border-red-500 ring-2 ring-red-400' },
+                { emoji: '🤔', label: 'Thoughtful', color: 'bg-purple-100 hover:bg-purple-200 border-purple-300', selectedColor: 'bg-purple-300 border-purple-500 ring-2 ring-purple-400' },
+              ].map((mood) => (
+                <button
+                  key={mood.label}
+                  onClick={() => handleMoodSelect(mood.label, mood.emoji)}
+                  disabled={moodSaving}
+                  className={`flex flex-col items-center px-4 py-3 rounded-xl border transition-all ${
+                    selectedMood === mood.label ? mood.selectedColor : mood.color
+                  } ${moodSaving ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                >
+                  <span className="text-2xl mb-1">{mood.emoji}</span>
+                  <span className="text-xs text-gray-600">{mood.label}</span>
+                </button>
+              ))}
+            </div>
           </div>
 
           <SearchBar value={searchQuery} onChange={setSearchQuery} />

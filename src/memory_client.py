@@ -112,6 +112,59 @@ class MemoryClient:
             "new_session": created
         }
 
+    async def save_mood(
+        self,
+        user_id: str,
+        mood: str,
+        emoji: str
+    ) -> Dict[str, Any]:
+        """
+        Save user's mood to long-term memory.
+
+        Args:
+            user_id: User identifier
+            mood: Mood label (e.g., "Happy", "Sad")
+            emoji: Emoji representing the mood
+
+        Returns:
+            Dict with status and memory info
+        """
+        client = await self._get_client()
+        now = datetime.now(timezone.utc)
+        date_str = now.strftime("%B %d, %Y")
+
+        # Create a memory record for the mood
+        memory = ClientMemoryRecord(
+            text=f"User is feeling {mood.lower()} {emoji} on {date_str}",
+            memory_type=MemoryTypeEnum.SEMANTIC,
+            user_id=user_id,
+            namespace=self.namespace,
+            topics=["mood", "feelings", "daily"],
+            entities=[mood.lower()],
+            created_at=now
+        )
+
+        try:
+            response = await client.create_long_term_memory(
+                memories=[memory],
+                deduplicate=False  # Allow multiple mood entries per day
+            )
+
+            return {
+                "status": "success",
+                "mood": mood,
+                "emoji": emoji,
+                "timestamp": now.isoformat(),
+                "stored": True
+            }
+        except Exception as e:
+            print(f"Error saving mood: {e}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "stored": False
+            }
+
     async def create_journal_memory(
         self,
         user_id: str,

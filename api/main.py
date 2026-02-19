@@ -308,6 +308,33 @@ def get_analytics(user_id: str = "default_user"):
     }
 
 
+# ============ MOOD ENDPOINT ============
+
+class MoodRequest(BaseModel):
+    """Request for saving mood."""
+    mood: str  # e.g., "Happy", "Sad"
+    emoji: str  # e.g., "😊", "😢"
+    user_id: str = "default_user"
+
+
+@app.post("/api/mood")
+async def save_mood(request: MoodRequest):
+    """Save user's current mood to memory."""
+    if not memory_client:
+        raise HTTPException(status_code=503, detail="Memory server not available")
+
+    result = await memory_client.save_mood(
+        user_id=request.user_id,
+        mood=request.mood,
+        emoji=request.emoji
+    )
+
+    if result.get("status") == "error":
+        raise HTTPException(status_code=500, detail=result.get("error", "Failed to save mood"))
+
+    return result
+
+
 # ============ AGENT ENDPOINTS ============
 
 class AgentChatRequest(BaseModel):

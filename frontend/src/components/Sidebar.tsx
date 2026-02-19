@@ -36,6 +36,30 @@ export default function Sidebar({ activeTab, onTabChange }: SidebarProps) {
 
       {/* Navigation */}
       <nav className="flex-1 p-4 overflow-y-auto">
+        {/* Today's Schedule */}
+        <div className="mb-6">
+          <h3 className="px-4 text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
+            📅 Today&apos;s Schedule
+          </h3>
+          <div className="space-y-2 px-2">
+            <div className="bg-white/60 rounded-lg p-3 border-l-4 border-blue-400">
+              <p className="text-xs text-blue-600 font-medium">10:00 AM</p>
+              <p className="text-sm text-gray-700">Team standup</p>
+              <p className="text-xs text-gray-400">Zoom</p>
+            </div>
+            <div className="bg-white/60 rounded-lg p-3 border-l-4 border-green-400">
+              <p className="text-xs text-green-600 font-medium">1:00 PM</p>
+              <p className="text-sm text-gray-700">Lunch with the girls</p>
+              <p className="text-xs text-gray-400">Cafe Coffee Day</p>
+            </div>
+            <div className="bg-white/60 rounded-lg p-3 border-l-4 border-purple-400">
+              <p className="text-xs text-purple-600 font-medium">3:30 PM</p>
+              <p className="text-sm text-gray-700">Project review</p>
+              <p className="text-xs text-gray-400">Conference Room B</p>
+            </div>
+          </div>
+        </div>
+
         <div className="space-y-1">
           {tabs.map((tab) => (
             <button
