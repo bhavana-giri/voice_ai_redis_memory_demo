@@ -104,38 +104,149 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
     setIsLoading(true);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/agent/chat`, {
+      // Use streaming endpoint for faster audio playback
+      const response = await fetch(`${API_BASE_URL}/api/agent/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           text: text || undefined,
           audio_base64: audioBase64,
           user_id: 'default_user',
-          session_id: sessionId  // Include session_id for conversation continuity
+          session_id: sessionId
         })
       });
 
-      const data = await response.json();
-
-      // Update session_id if returned from server (for new sessions)
-      if (data.session_id && data.session_id !== sessionId) {
-        setSessionId(data.session_id);
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`);
       }
 
-      const assistantMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: data.response,
-        timestamp: new Date(),
-        audioBase64: data.audio_base64
-      };
-      setMessages(prev => [...prev, assistantMessage]);
-      setMode(data.mode);
-      setEntryCount(data.entry_count);
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No reader available');
 
-      // Auto-play TTS if available
-      if (data.audio_base64) {
-        playAudio(data.audio_base64);
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      // Progressive audio playback using MediaSource API
+      let mediaSource: MediaSource | null = null;
+      let sourceBuffer: SourceBuffer | null = null;
+      let audio: HTMLAudioElement | null = null;
+      let audioQueue: Uint8Array[] = [];
+      let isSourceOpen = false;
+
+      const initMediaSource = () => {
+        mediaSource = new MediaSource();
+        audio = new Audio();
+        audio.src = URL.createObjectURL(mediaSource);
+
+        mediaSource.addEventListener('sourceopen', () => {
+          try {
+            // MP3 MIME type for streaming
+            sourceBuffer = mediaSource!.addSourceBuffer('audio/mpeg');
+            sourceBuffer.mode = 'sequence';
+            isSourceOpen = true;
+
+            // Process any queued chunks
+            sourceBuffer.addEventListener('updateend', () => {
+              if (audioQueue.length > 0 && sourceBuffer && !sourceBuffer.updating) {
+                const chunk = audioQueue.shift()!;
+                sourceBuffer.appendBuffer(chunk);
+              }
+            });
+
+            // Append any chunks that arrived before sourceopen
+            if (audioQueue.length > 0 && !sourceBuffer.updating) {
+              const chunk = audioQueue.shift()!;
+              sourceBuffer.appendBuffer(chunk);
+            }
+          } catch (e) {
+            console.error('Failed to create source buffer:', e);
+          }
+        });
+      };
+
+      const appendAudioChunk = (chunk: Uint8Array) => {
+        if (!mediaSource) {
+          initMediaSource();
+        }
+
+        if (isSourceOpen && sourceBuffer && !sourceBuffer.updating) {
+          try {
+            sourceBuffer.appendBuffer(chunk);
+            // Start playback after first chunk
+            if (audio && audio.paused) {
+              audio.play().catch(console.error);
+            }
+          } catch (e) {
+            audioQueue.push(chunk);
+          }
+        } else {
+          audioQueue.push(chunk);
+        }
+      };
+
+      // Process the stream
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+
+          if (line.startsWith('AUDIO:')) {
+            // Audio chunk - decode and play progressively
+            const audioBase64 = line.substring(6);
+            const binaryString = atob(audioBase64);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+            appendAudioChunk(bytes);
+          } else {
+            // JSON message (metadata, done, or error)
+            try {
+              const msg = JSON.parse(line);
+              if (msg.type === 'metadata') {
+                // Update session_id if returned
+                if (msg.session_id && msg.session_id !== sessionId) {
+                  setSessionId(msg.session_id);
+                }
+                // Add assistant message immediately (before audio finishes)
+                const assistantMessage: Message = {
+                  id: (Date.now() + 1).toString(),
+                  role: 'assistant',
+                  content: msg.response,
+                  timestamp: new Date()
+                };
+                setMessages(prev => [...prev, assistantMessage]);
+                setMode(msg.mode);
+                setEntryCount(msg.entry_count);
+              } else if (msg.type === 'done') {
+                // Signal end of stream to MediaSource
+                if (mediaSource && mediaSource.readyState === 'open') {
+                  // Wait for all buffers to be appended before ending
+                  const endStream = () => {
+                    if (sourceBuffer && !sourceBuffer.updating && audioQueue.length === 0) {
+                      try {
+                        mediaSource!.endOfStream();
+                      } catch (e) {
+                        // Ignore if already ended
+                      }
+                    } else {
+                      setTimeout(endStream, 50);
+                    }
+                  };
+                  endStream();
+                }
+              }
+            } catch (e) {
+              console.error('Failed to parse message:', line, e);
+            }
+          }
+        }
       }
     } catch (error) {
       console.error('Chat error:', error);
@@ -151,7 +262,7 @@ export default function ChatInterface({ isOpen, onClose }: ChatInterfaceProps) {
   };
 
   const playAudio = (base64: string) => {
-    const audio = new Audio(`data:audio/wav;base64,${base64}`);
+    const audio = new Audio(`data:audio/mp3;base64,${base64}`);
     audio.play().catch(console.error);
   };
 

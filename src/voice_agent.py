@@ -14,8 +14,10 @@ import httpx
 from dotenv import load_dotenv
 
 from src.journal_store import JournalStore
-from src.intent_detector import IntentDetector, Intent, IntentResult
+from src.intent_detector import Intent, IntentResult  # Keep Intent/IntentResult, remove IntentDetector
 from src.memory_client import MemoryClient
+from src.calendar_client import CalendarClient
+from src.intent_router import get_intent_router
 
 load_dotenv()
 
@@ -46,42 +48,77 @@ class VoiceJournalAgent:
         self.session_id = session_id  # For working memory (conversation continuity)
         self.store = JournalStore()
         self.memory_client = memory_client  # For searching long-term memory (memory_idx)
-        self.intent_detector = IntentDetector(use_llm=False)  # Rule-based for speed
         self.state = AgentState()
         self.api_key = os.getenv("OPENAI_API_KEY")
-    
-    # Keywords that trigger logging instead of chat
+
+        # Initialize calendar client (lazy load on first use)
+        self._calendar_client: Optional[CalendarClient] = None
+
+        # Semantic router for intent detection (lazy load)
+        self._intent_router = None
+
+    # Fallback keywords (used if semantic router fails)
     LOG_KEYWORDS = ["log my note", "note this", "record this", "journal this", "save this", "remember this"]
+
+    @property
+    def calendar_client(self) -> Optional[CalendarClient]:
+        """Lazy-load calendar client."""
+        if self._calendar_client is None:
+            try:
+                self._calendar_client = CalendarClient()
+            except Exception as e:
+                print(f"[Calendar] Init error: {e}")
+        return self._calendar_client
 
     async def process_input(self, text: str) -> Tuple[str, Optional[bytes]]:
         """
         Process user input and generate response.
 
-        Simplified routing:
-        - Explicit "log/note/record" keywords -> save as journal entry
-        - Everything else -> conversation/chat
+        Uses semantic router for intent detection:
+        - "log" intent -> save as journal entry
+        - "calendar" intent -> fetch calendar + respond
+        - "chat" intent -> search journal + respond
         """
-        text_lower = text.lower().strip()
+        import time
+        import asyncio
 
-        # Check for explicit log intent (simple string check - no LLM needed)
-        is_log = any(kw in text_lower for kw in self.LOG_KEYWORDS)
+        # Use semantic router for intent detection
+        intent_start = time.time()
+        try:
+            if self._intent_router is None:
+                self._intent_router = get_intent_router()
+            # Run in thread to avoid blocking (embedding API call)
+            intent, confidence = await asyncio.to_thread(
+                self._intent_router.detect, text, 0.5
+            )
+        except Exception as e:
+            print(f"[Intent Router] Error: {e}, falling back to keywords")
+            # Fallback to keyword matching
+            text_lower = text.lower()
+            if any(kw in text_lower for kw in self.LOG_KEYWORDS):
+                intent, confidence = "log", 0.8
+            else:
+                intent, confidence = "chat", 0.5
 
-        if is_log:
-            # Extract content after the keyword
+        print(f"[TIMING] Intent detection: {time.time() - intent_start:.2f}s -> {intent} ({confidence:.2f})")
+
+        if intent == "log":
+            # Extract content (remove common prefixes)
             content = text
-            for kw in self.LOG_KEYWORDS:
-                if kw in text_lower:
-                    idx = text_lower.find(kw)
-                    content = text[idx + len(kw):].strip()
-                    if not content:
-                        content = text  # Use full text if nothing after keyword
+            for prefix in ["log my note", "note this down", "remember this", "record this", "note this"]:
+                if text.lower().startswith(prefix):
+                    content = text[len(prefix):].strip()
+                    if content.startswith(":"):
+                        content = content[1:].strip()
                     break
+            if not content:
+                content = text
 
-            result = IntentResult(Intent.LOG_ENTRY, 1.0, {"content": content}, text)
+            result = IntentResult(Intent.LOG_ENTRY, confidence, {"content": content}, text)
             response = await self._handle_log(result)
         else:
-            # Default: treat as conversation/question
-            result = IntentResult(Intent.ASK_JOURNAL, 1.0, {"query": text}, text)
+            # Both "calendar" and "chat" go through _handle_ask (it detects calendar internally)
+            result = IntentResult(Intent.ASK_JOURNAL, confidence, {"query": text, "is_calendar": intent == "calendar"}, text)
             response = await self._handle_ask(result)
 
         # Add to conversation history
@@ -125,7 +162,7 @@ class VoiceJournalAgent:
             return "Sorry, I had trouble saving that. Could you try again?"
     
     async def _handle_ask(self, result: IntentResult) -> str:
-        """Handle questions about journal entries."""
+        """Handle questions about journal entries and calendar."""
         import time
         import asyncio
         self.state.mode = AgentMode.CHAT
@@ -135,10 +172,11 @@ class VoiceJournalAgent:
         if not self.memory_client:
             return "Sorry, memory service is not available. Could you try again later?"
 
-        # Run working memory fetch and memory search IN PARALLEL
+        # Use intent from semantic router (passed via entities)
+        is_calendar_query = result.entities.get("is_calendar", False)
+
+        # Run fetches IN PARALLEL
         parallel_start = time.time()
-        conversation_context = ""
-        memories = []
 
         async def fetch_conversation():
             if self.session_id:
@@ -146,36 +184,49 @@ class VoiceJournalAgent:
                     return await self.memory_client.get_conversation_context(
                         session_id=self.session_id,
                         user_id=self.user_id,
-                        max_turns=3  # Reduced for speed
+                        max_turns=3
                     )
                 except Exception as e:
                     print(f"[Working Memory] Error: {e}")
             return ""
 
         async def search_memories():
+            # Skip memory search for pure calendar queries (faster)
+            if is_calendar_query:
+                return []
             try:
                 return await self.memory_client.search_long_term_memory(
                     query=query,
                     user_id=self.user_id,
-                    limit=5,  # Reduced from 8 for speed
+                    limit=5,
                     distance_threshold=0.8
                 )
             except Exception as e:
                 print(f"[Memory Search] Error: {e}")
                 return []
 
-        # Execute both in parallel
-        conversation_context, memories = await asyncio.gather(
+        async def fetch_calendar():
+            if is_calendar_query and self.calendar_client:
+                try:
+                    # Run sync calendar API in thread pool to avoid blocking
+                    return await asyncio.to_thread(self.calendar_client.get_calendar_context)
+                except Exception as e:
+                    print(f"[Calendar] Error: {e}")
+            return ""
+
+        # Execute in parallel
+        conversation_context, memories, calendar_context = await asyncio.gather(
             fetch_conversation(),
-            search_memories()
+            search_memories(),
+            fetch_calendar()
         )
-        print(f"[TIMING] Parallel fetch+search: {time.time() - parallel_start:.2f}s ({len(memories)} results)")
+        print(f"[TIMING] Parallel fetch: {time.time() - parallel_start:.2f}s (memories: {len(memories)}, calendar: {bool(calendar_context)})")
 
         # Build context and generate response
         journal_context = self._build_memory_context(memories) if memories else ""
 
         llm_start = time.time()
-        response = await self._generate_chat_response(query, journal_context, conversation_context)
+        response = await self._generate_chat_response(query, journal_context, conversation_context, calendar_context)
         print(f"[TIMING] LLM response: {time.time() - llm_start:.2f}s")
 
         self.state.last_entries_shown = [m.get("id", "") for m in memories] if memories else []
@@ -230,18 +281,22 @@ class VoiceJournalAgent:
         self,
         query: str,
         journal_context: str,
-        conversation_context: str = ""
+        conversation_context: str = "",
+        calendar_context: str = ""
     ) -> str:
-        """Generate a natural response based on query, journal context, and conversation history."""
-        system_prompt = """You are a voice journal assistant. Be brief and natural.
+        """Generate a natural response based on query, journal context, conversation history, and calendar."""
+        system_prompt = """You are a voice journal assistant with calendar access. Be brief and natural.
 - Max 2-3 sentences
-- Use journal entries as context
+- Use journal entries and calendar events as context
+- For calendar queries, mention specific events and times
 - Maintain conversation flow"""
 
         # Build compact prompt
         parts = []
         if conversation_context:
             parts.append(f"Chat history:\n{conversation_context}")
+        if calendar_context:
+            parts.append(f"Calendar:\n{calendar_context}")
         if journal_context:
             parts.append(f"Journal:\n{journal_context}")
         parts.append(f"User: {query}")

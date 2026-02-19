@@ -10,6 +10,7 @@ from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -459,9 +460,8 @@ async def agent_chat(request: AgentChatRequest):
         # Get current entry count
         entry_count = agent.store.get_entry_count(request.user_id)
 
-        # Get intent safely
-        intent_result = agent.intent_detector._rule_based_detect(text)
-        intent_str = intent_result.intent.value if intent_result else "unknown"
+        # Infer intent from mode (semantic router already detected it in process_input)
+        intent_str = agent.state.mode.value  # "log" or "chat"
 
         timings['total'] = time.time() - total_start
         print(f"[TIMING] TOTAL: {timings['total']:.2f}s | STT: {timings.get('stt', 0):.2f}s | Agent: {timings.get('agent', 0):.2f}s | TTS: {timings.get('tts', 0):.2f}s")
@@ -479,6 +479,91 @@ async def agent_chat(request: AgentChatRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/agent/chat/stream")
+async def agent_chat_stream(request: AgentChatRequest):
+    """
+    Streaming version of agent chat - streams TTS audio chunks as they arrive.
+
+    First sends JSON metadata (response text, intent, etc.), then streams audio chunks.
+    Uses multipart response: first part is JSON, subsequent parts are audio chunks.
+    """
+    import time
+    import json
+
+    text = request.text
+    transcribed_text = None
+
+    # If audio provided, transcribe first (same as non-streaming endpoint)
+    if request.audio_base64 and not text:
+        try:
+            audio_data = base64.b64decode(request.audio_base64)
+            is_wav = audio_data[:4] == b'RIFF' and audio_data[8:12] == b'WAVE'
+
+            if is_wav:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                    f.write(audio_data)
+                    temp_path = f.name
+                try:
+                    text, _ = await audio_handler.transcribe_stream(temp_path, language_code="en-IN")
+                finally:
+                    os.unlink(temp_path)
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
+                    f.write(audio_data)
+                    temp_path = f.name
+                try:
+                    text, _ = audio_handler.transcribe(temp_path)
+                finally:
+                    os.unlink(temp_path)
+            transcribed_text = text
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Audio transcription failed: {e}")
+
+    if not text:
+        raise HTTPException(status_code=400, detail="Either text or audio_base64 is required")
+
+    session_id = request.session_id or f"session_{uuid.uuid4().hex[:12]}"
+    agent = get_or_create_agent(request.user_id, session_id)
+
+    # Get agent response (text only)
+    response_text, _ = await agent.process_input(text)
+    entry_count = agent.store.get_entry_count(request.user_id)
+    intent_str = agent.state.mode.value
+
+    async def generate_stream():
+        """Generator that yields JSON metadata then audio chunks."""
+        # First, yield JSON metadata as a line
+        metadata = {
+            "type": "metadata",
+            "response": response_text,
+            "intent": intent_str,
+            "mode": agent.get_mode(),
+            "entry_count": entry_count,
+            "session_id": session_id,
+            "transcribed_text": transcribed_text
+        }
+        yield json.dumps(metadata).encode() + b"\n"
+
+        # Then stream TTS audio chunks
+        try:
+            async for chunk in audio_handler.text_to_speech_stream(response_text, "en-IN", "shubh"):
+                # Yield audio chunk with a simple prefix to identify it
+                yield b"AUDIO:" + base64.b64encode(chunk) + b"\n"
+        except Exception as e:
+            print(f"[TTS Stream Error] {e}")
+            # Yield error message
+            yield json.dumps({"type": "error", "message": str(e)}).encode() + b"\n"
+
+        # Signal end of stream
+        yield json.dumps({"type": "done"}).encode() + b"\n"
+
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/plain",
+        headers={"X-Content-Type-Options": "nosniff"}
+    )
 
 
 @app.get("/api/agent/mode")

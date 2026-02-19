@@ -5,6 +5,14 @@
 .env.production
 .env*.local
 
+# Google OAuth credentials
+credentials.json
+token.json
+
+# Markdown files (except README)
+*.md
+!README.md
+
 # Python
 __pycache__/
 *.py[cod]
