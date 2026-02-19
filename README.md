@@ -22,7 +22,6 @@ AI-powered voice journaling application that demonstrates how **Redis Agent Memo
 - [Architecture](#architecture)
 - [Project Structure](#project-structure)
 - [Usage](#usage)
-- [API Endpoints](#api-endpoints)
 - [Resources](#resources)
 - [License](#license)
 
@@ -149,79 +148,43 @@ The frontend will be available at: http://localhost:3000
 ## Architecture
 
 ```mermaid
-flowchart TD
-    subgraph Frontend["🎨 Frontend (Next.js)"]
-        UI[Web UI]
-        MIC[🎤 Microphone]
-        SPEAKER[🔊 Audio Player]
+flowchart LR
+    subgraph User["👤 User"]
+        MIC[🎤 Voice]
+        SPEAKER[🔊 Audio]
     end
 
-    subgraph Backend["⚙️ Backend (FastAPI)"]
-        API[API Server<br/>:8080]
+    subgraph App["Voice Journal App"]
+        FE[Next.js<br/>Frontend]
+        BE[FastAPI<br/>Backend]
         AGENT[Voice Agent]
-        ROUTER[Intent Router<br/>RedisVL]
     end
 
-    subgraph Voice["🗣️ Sarvam AI"]
-        STT[Saaras v3<br/>Speech-to-Text]
-        TTS[Bulbul v3<br/>Text-to-Speech]
+    subgraph AI["AI Services"]
+        STT[Sarvam STT]
+        TTS[Sarvam TTS]
+        LLM[Ollama]
+        ROUTER[RedisVL<br/>Intent Router]
     end
 
-    subgraph Memory["🧠 Redis Agent Memory Server"]
-        AMS[Memory Server<br/>:8000]
-        WM[Working Memory<br/>Session-scoped]
-        LTM[Long-term Memory<br/>Persistent]
+    subgraph Memory["Redis Agent Memory Server"]
+        WM[Working Memory]
+        LTM[Long-term Memory]
     end
 
-    subgraph Storage["💾 Redis Cloud"]
-        VEC[(Vector Index)]
-        JSON[(JSON Store)]
+    subgraph Storage["Redis Cloud"]
+        VEC[(Vectors)]
     end
 
-    subgraph External["🔗 External"]
-        GCAL[Google Calendar]
-    end
-
-    MIC -->|Audio| UI
-    UI -->|Audio/Text| API
-    API -->|Audio| STT
-    STT -->|Transcript| AGENT
-    AGENT -->|Query| ROUTER
-    ROUTER -->|Intent| AGENT
-    AGENT -->|Search/Store| AMS
-    AMS --> WM
-    AMS --> LTM
+    MIC --> FE --> BE
+    BE --> STT --> AGENT
+    AGENT --> ROUTER
+    AGENT --> LLM
+    AGENT <--> WM
+    AGENT <--> LTM
     WM --> VEC
     LTM --> VEC
-    LTM --> JSON
-    AGENT -->|Calendar Query| GCAL
-    AGENT -->|Response Text| TTS
-    TTS -->|Audio Stream| API
-    API -->|Response| UI
-    UI --> SPEAKER
-```
-
-### Request Flow
-
-```
-User Voice Input
-    ↓
-[Sarvam STT] → Transcribe speech to text
-    ↓
-[Intent Router] → Detect intent (log, calendar, chat)
-    ↓
-[Agent Processing]
-    ├→ Log intent → Save to long-term memory
-    ├→ Calendar intent → Fetch Google Calendar events
-    └→ Chat intent → Search journal + generate response
-    ↓
-[Redis Agent Memory Server]
-    ├→ Store in long-term memory
-    └→ Update working memory
-    ↓
-[Sarvam TTS] → Stream audio response
-    ↓
-Response to User
+    AGENT --> TTS --> BE --> FE --> SPEAKER
 ```
 
 ## Project Structure
@@ -272,18 +235,6 @@ voice_ai_redis_memory_demo/
    - "Remember that I need to buy groceries"
 
 The agent remembers your entries across sessions, so you can return anytime and ask about past entries.
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/agent/chat` | POST | Main chat endpoint (text or audio input) |
-| `/api/agent/chat/stream` | POST | Streaming chat with TTS audio chunks |
-| `/api/transcribe` | POST | Transcribe audio to text |
-| `/api/tts` | POST | Convert text to speech |
-| `/api/mood` | POST | Save mood to memory |
-| `/api/calendar/events` | GET | Get Google Calendar events |
-| `/health` | GET | Health check |
 
 ## Resources
 
